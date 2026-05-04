@@ -1,18 +1,22 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from models import Signal
 from redis_client import redis_client
 from fastapi.encoders import jsonable_encoder
-
-
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from db import SessionLocal
 from models_db import WorkItem
-
 from datetime import datetime
 import json
 
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI()
 
-from fastapi.middleware.cors import CORSMiddleware
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,9 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# VALID STATES
-# -----------------------------
 VALID_TRANSITIONS = {
     "OPEN": ["INVESTIGATING"],
     "INVESTIGATING": ["RESOLVED"],
@@ -32,28 +33,17 @@ VALID_TRANSITIONS = {
     "CLOSED": []
 }
 
-
-# -----------------------------
-# ROOT
-# -----------------------------
 @app.get("/")
 def read_root():
     return {"message": "IMS Backend Running"}
 
-
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-# -----------------------------
-# INGEST SIGNAL (PRODUCER)
-# -----------------------------
 @app.post("/api/v1/ingest")
-async def ingest_signal(signal: Signal):
+@limiter.limit("1000/minute")
+async def ingest_signal(request: Request, signal: Signal):
     try:
         encoded_signal = jsonable_encoder(signal)
         redis_client.lpush("signal_queue", json.dumps(encoded_signal))
@@ -61,14 +51,9 @@ async def ingest_signal(signal: Signal):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# -----------------------------
-# UPDATE WORK ITEM (WORKFLOW ENGINE)
-# -----------------------------
 @app.put("/api/v1/work_item/{item_id}")
 def update_work_item(item_id: int, status: str, rca: str = None):
     db = SessionLocal()
-
     item = db.query(WorkItem).filter(WorkItem.id == item_id).first()
 
     if not item:
@@ -78,80 +63,41 @@ def update_work_item(item_id: int, status: str, rca: str = None):
     new_status = status.upper()
     current_status = item.status
 
-    # -----------------------------
-    # BLOCK CHANGES AFTER CLOSED
-    # -----------------------------
     if current_status == "CLOSED":
         db.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot update CLOSED incident"
-        )
+        raise HTTPException(status_code=400, detail="Cannot update CLOSED incident")
 
-    # -----------------------------
-    # VALIDATE STATE TRANSITION
-    # -----------------------------
     if new_status not in VALID_TRANSITIONS.get(current_status, []):
         db.close()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid transition: {current_status} → {new_status}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid transition: {current_status} → {new_status}")
 
-    # -----------------------------
-    # RCA VALIDATION (STRICT)
-    # -----------------------------
     if new_status == "CLOSED":
         if not rca or rca.strip() == "" or rca.lower() == "rca":
             db.close()
-            raise HTTPException(
-                status_code=400,
-                detail="Valid RCA is required before closing"
-            )
+            raise HTTPException(status_code=400, detail="Valid RCA is required before closing")
 
-    # -----------------------------
-    # APPLY STATUS UPDATE
-    # -----------------------------
     item.status = new_status
 
-    # -----------------------------
-    # SET RESOLVED TIME
-    # -----------------------------
     if new_status == "RESOLVED":
         item.resolved_at = datetime.utcnow()
 
-    # -----------------------------
-    # STORE RCA
-    # -----------------------------
     if rca:
         item.rca = rca
 
     db.commit()
 
-    # -----------------------------
-    # MTTR CALCULATION
-    # -----------------------------
     mttr = None
     if item.resolved_at:
         mttr = (item.resolved_at - item.created_at).total_seconds()
 
     db.close()
 
-    return {
-        "message": "updated",
-        "mttr_seconds": mttr
-    }
+    return {"message": "updated", "mttr_seconds": mttr}
 
-
-# -----------------------------
-# GET ALL WORK ITEMS
-# -----------------------------
 @app.get("/api/v1/work_items")
 def get_work_items():
     db = SessionLocal()
-
     items = db.query(WorkItem).all()
-
     result = []
     for item in items:
         result.append({
@@ -162,7 +108,5 @@ def get_work_items():
             "resolved_at": item.resolved_at,
             "rca": item.rca
         })
-
     db.close()
-
     return result
