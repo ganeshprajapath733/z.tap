@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+redis
+pymongo
+psycopg2-binary
+sqlalchemy
+asyncpg
